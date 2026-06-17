@@ -291,3 +291,6 @@ export default function App() {
                       href={img.url} 
                       download={img.filename} 
                       style={{ 
+
+
+display: 'block',textAlign: 'center',background: '#007aff',color: '#fff',textDecoration: 'none',fontSize: '12px',padding: '6px 0',borderRadius: '4px',fontWeight: 'bold'}}>保存))})});}
