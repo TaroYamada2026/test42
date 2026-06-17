@@ -1,13 +1,14 @@
 import React, { useState } from 'react';
 
 // ============================================================================
-// 1. 超軽量・単一ファイル用 ZIP 生成エンジン
+// 1. 超軽量・単一ファイル用 ZIP 生成エンジン（フォルダ階層対応版）
 // ============================================================================
 class SimpleZipWriter {
   private files: { name: string; data: Uint8Array }[] = [];
 
-  addFile(name: string, data: Uint8Array) {
-    this.files.push({ name, data });
+  // ファイルを追加する（フォルダ名を含んだパス「フォルダ名/ファイル名」を受け取り可能）
+  addFile(path: string, data: Uint8Array) {
+    this.files.push({ name: path, data });
   }
 
   generateBlob(): Blob {
@@ -247,12 +248,55 @@ class BinaryPlistParser {
     return null;
   }
 }
+
 // ============================================================================
-// 3. React メインコンポーネント (hタグ抽出機能付き)
+// 3. 画像フォーマット変換エンジン（WebP -> JPEG）
+// ============================================================================
+const convertWebPToJPG = (blob: Blob): Promise<Uint8Array> => {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.src = URL.createObjectURL(blob);
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        reject(new Error('Canvasの初期化に失敗しました'));
+        return;
+      }
+      // 白背景を敷く（透過部分が黒くなるのを防ぐため）
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0);
+      
+      canvas.toBlob((jpgBlob) => {
+        if (!jpgBlob) {
+          reject(new Error('JPGへの変換に失敗しました'));
+          return;
+        }
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          if (reader.result instanceof ArrayBuffer) {
+            resolve(new Uint8Array(reader.result));
+          } else {
+            reject(new Error('バイナリの読み込みに失敗しました'));
+          }
+        };
+        reader.readAsArrayBuffer(jpgBlob);
+      }, 'image/jpeg', 0.9); // 品質 90%
+      URL.revokeObjectURL(img.src);
+    };
+    img.onerror = () => reject(new Error('画像の読み込みに失敗しました'));
+  });
+};
+// ============================================================================
+// 4. React メインコンポーネント (フォルダ分け＆WebP→JPG変換対応版)
 // ============================================================================
 interface ExtractedImage {
   id: string;
   rawData: Uint8Array;
+  blob: Blob;
   url: string;
   mimeType: string;
   filename: string;
@@ -268,17 +312,11 @@ export default function App() {
   // HTMLのバイナリ(Uint8Array)から最初のh1〜h6タグの文字を抽出する関数
   const extractHeadingText = (htmlData: any): string | null => {
     if (!htmlData || !(htmlData instanceof Uint8Array)) return null;
-
     try {
-      // バイナリをテキスト文字列に変換
       const decoder = new TextDecoder('utf-8');
       const htmlText = decoder.decode(htmlData);
-
-      // ブラウザのDOMParserを使って仮想のHTML構造を作成
       const parser = new DOMParser();
       const doc = parser.parseFromString(htmlText, 'text/html');
-
-      // h1からh6まで順番に検索し、最初に見つかったタグの文字を返す
       const headingTags = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'];
       for (const tag of headingTags) {
         const element = doc.querySelector(tag);
@@ -307,24 +345,21 @@ export default function App() {
       const parser = new BinaryPlistParser(arrayBuffer);
       const parsedArchive = parser.parse();
 
-      // --- 動的ZIPファイル名の決定処理 ---
-      // メインHTMLリソースからhタグテキストを抽出
+      // メインHTMLリソースからhタグテキストを抽出してZIP名にする
       const mainResource = parsedArchive.WebMainResource;
       if (mainResource && mainResource.WebResourceData) {
         const foundTitle = extractHeadingText(mainResource.WebResourceData);
         if (foundTitle) {
-          // OSのファイル名に使えない禁止文字（\ / : * ? " < > |）と、念のため改行を除去
           const cleanedTitle = foundTitle
             .replace(/[\\/:*?"<>|\r\n]/g, '')
-            .substring(0, 50); // 長すぎる場合の文字数制限（50文字）
-          
+            .substring(0, 50);
           if (cleanedTitle) {
             setZipName(cleanedTitle);
           }
         }
       }
 
-      // --- 画像リソースの抽出処理 ---
+      // 画像リソースの抽出処理
       const subresources = parsedArchive.WebSubresources || [];
       const extracted: ExtractedImage[] = [];
 
@@ -351,6 +386,7 @@ export default function App() {
             extracted.push({
               id: `${index}-${rawFilename}`,
               rawData,
+              blob,
               url: objectUrl,
               mimeType,
               filename: rawFilename,
@@ -372,6 +408,7 @@ export default function App() {
     }
   };
 
+  // ZIP生成・フォルダ仕分け・WebP→JPG同時変換
   const downloadAllAsZip = async () => {
     if (images.length === 0) return;
     setZipLoading(true);
@@ -379,40 +416,85 @@ export default function App() {
 
     try {
       const zipWriter = new SimpleZipWriter();
-      const usedNames = new Set<string>();
+      const usedNamesWebP = new Set<string>();
+      const usedNamesJPG = new Set<string>();
 
-      images.forEach((img) => {
-        let uniqueName = img.filename;
-        let counter = 1;
+      // すべての画像をループ処理
+      for (const img of images) {
+        const isWebP = img.mimeType.includes('webp') || img.filename.toLowerCase().endsWith('.webp');
 
-        while (usedNames.has(uniqueName)) {
-          const dots = img.filename.lastIndexOf('.');
-          if (dots !== -1) {
-            const base = img.filename.substring(0, dots);
-            const ext = img.filename.substring(dots);
-            uniqueName = `${base}_${counter}${ext}`;
-          } else {
-            uniqueName = `${img.filename}_${counter}`;
+        if (isWebP) {
+          // --- 1. 元のWebP画像を「webp/」フォルダへ格納 ---
+          let uniqueWebPName = img.filename;
+          let counterWebP = 1;
+          while (usedNamesWebP.has(uniqueWebPName)) {
+            const dots = img.filename.lastIndexOf('.');
+            const base = dots !== -1 ? img.filename.substring(0, dots) : img.filename;
+            const ext = dots !== -1 ? img.filename.substring(dots) : '.webp';
+            uniqueWebPName = `${base}_${counterWebP}${ext}`;
+            counterWebP++;
           }
-          counter++;
-        }
-        usedNames.add(uniqueName);
-        zipWriter.addFile(uniqueName, img.rawData);
-      });
+          usedNamesWebP.add(uniqueWebPName);
+          // パス形式で渡すことでZIP内にフォルダが自動作成されます
+          zipWriter.addFile(`webp/${uniqueWebPName}`, img.rawData);
 
+          // --- 2. JPEGに変換して「jpg/」フォルダへ格納 ---
+          try {
+            const jpgData = await convertWebPToJPG(img.blob);
+            
+            // ファイル拡張子を.jpgに変更
+            const dots = img.filename.lastIndexOf('.');
+            const baseName = dots !== -1 ? img.filename.substring(0, dots) : img.filename;
+            let uniqueJPGName = `${baseName}.jpg`;
+            
+            let counterJPG = 1;
+            while (usedNamesJPG.has(uniqueJPGName)) {
+              uniqueJPGName = `${baseName}_${counterJPG}.jpg`;
+              counterJPG++;
+            }
+            usedNamesJPG.add(uniqueJPGName);
+            zipWriter.addFile(`jpg/${uniqueJPGName}`, jpgData);
+          } catch (convErr) {
+            console.error(`${img.filename} のJPG変換に失敗しました:`, convErr);
+            // 変換に失敗した場合は、最悪スキップするか元のデータをそのままjpgフォルダに置く等の対処
+          }
+        } else {
+          // WebP以外の画像（PNGやJPEGなど）は、そのまま「jpg/」または共通フォルダに振る仕様
+          // 今回はjpgフォルダ側に統一して格納する形で名前のクレンジングを行います
+          let uniqueNormalName = img.filename;
+          
+          // もし拡張子がjpegなら、フォルダ名に合わせて見た目を.jpgに統一
+          if (uniqueNormalName.toLowerCase().endsWith('.jpeg')) {
+            uniqueNormalName = uniqueNormalName.substring(0, uniqueNormalName.length - 5) + '.jpg';
+          }
+
+          let counterNormal = 1;
+          while (usedNamesJPG.has(uniqueNormalName)) {
+            const dots = uniqueNormalName.lastIndexOf('.');
+            const base = dots !== -1 ? uniqueNormalName.substring(0, dots) : uniqueNormalName;
+            const ext = dots !== -1 ? uniqueNormalName.substring(dots) : '';
+            uniqueNormalName = `${base}_${counterNormal}${ext}`;
+            counterNormal++;
+          }
+          usedNamesJPG.add(uniqueNormalName);
+          zipWriter.addFile(`jpg/${uniqueNormalName}`, img.rawData);
+        }
+      }
+
+      // バイナリをZIPに変換してダウンロード発火
       const zipBlob = zipWriter.generateBlob();
       const zipUrl = URL.createObjectURL(zipBlob);
 
       const link = document.createElement('a');
       link.href = zipUrl;
-      link.download = `${zipName}.zip`; // 抽出したhタグの名前を適用
+      link.download = `${zipName}.zip`;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(zipUrl);
     } catch (err: any) {
       console.error(err);
-      setError('ZIPファイルの生成に失敗しました。');
+      setError('ZIPファイルの生成・変換中にエラーが発生しました。');
     } finally {
       setZipLoading(false);
     }
@@ -421,7 +503,7 @@ export default function App() {
   return (
     <div>
       <h1>Webアーカイブ 画像抽出ツール</h1>
-      <p>サーバーなし・ブラウザ内完結</p>
+      <p>サーバーなし・ブラウザ内完結（WebPのJPG変換フォルダ分け機能付き）</p>
 
       <div>
         <input 
@@ -440,11 +522,14 @@ export default function App() {
           <h3>📊 抽出結果</h3>
           <p>画像の総数: <strong>{images.length} 件</strong></p>
           <p>予定ファイル名: <strong>{zipName}.zip</strong></p>
+          <p style={{ fontSize: '12px', color: '#666' }}>
+            ※一括保存すると、ZIPの中に「webp」フォルダと「jpg」フォルダが自動作成され、WebP画像は自動的に両方に仕分け・変換格納されます。
+          </p>
           <button 
             onClick={downloadAllAsZip} 
             disabled={zipLoading}
           >
-            {zipLoading ? '⏳ ZIPを作成中...' : '📦 すべての画像をZIPで一括保存'}
+            {zipLoading ? '⏳ 画像をJPGへ変換＆ZIPを作成中...' : '📦 フォルダ分けしてZIPで一括保存'}
           </button>
         </div>
       )}
@@ -458,7 +543,7 @@ export default function App() {
               style={{ maxWidth: '200px', display: 'block' }} 
             />
             <p>{img.filename} ({img.mimeType})</p>
-            <a href={img.url} download={img.filename}>個別で保存</a>
+            <a href={img.url} download={img.filename}>個別で保存（元の形式）</a>
           </div>
         ))}
       </div>
