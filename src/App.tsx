@@ -248,7 +248,7 @@ class BinaryPlistParser {
   }
 }
 // ============================================================================
-// 3. React メインコンポーネント (エラー対策＆完全自己完結版)
+// 3. React メインコンポーネント (hタグ抽出機能付き)
 // ============================================================================
 interface ExtractedImage {
   id: string;
@@ -260,9 +260,38 @@ interface ExtractedImage {
 
 export default function App() {
   const [images, setImages] = useState<ExtractedImage[]>([]);
+  const [zipName, setZipName] = useState<string>('extracted_images');
   const [loading, setLoading] = useState<boolean>(false);
   const [zipLoading, setZipLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+
+  // HTMLのバイナリ(Uint8Array)から最初のh1〜h6タグの文字を抽出する関数
+  const extractHeadingText = (htmlData: any): string | null => {
+    if (!htmlData || !(htmlData instanceof Uint8Array)) return null;
+
+    try {
+      // バイナリをテキスト文字列に変換
+      const decoder = new TextDecoder('utf-8');
+      const htmlText = decoder.decode(htmlData);
+
+      // ブラウザのDOMParserを使って仮想のHTML構造を作成
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(htmlText, 'text/html');
+
+      // h1からh6まで順番に検索し、最初に見つかったタグの文字を返す
+      const headingTags = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'];
+      for (const tag of headingTags) {
+        const element = doc.querySelector(tag);
+        if (element && element.textContent) {
+          const text = element.textContent.trim();
+          if (text) return text;
+        }
+      }
+    } catch (e) {
+      console.error('hタグの解析に失敗しました:', e);
+    }
+    return null;
+  };
 
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -271,12 +300,31 @@ export default function App() {
     setLoading(true);
     setError(null);
     setImages([]);
+    setZipName('extracted_images');
 
     try {
       const arrayBuffer = await file.arrayBuffer();
       const parser = new BinaryPlistParser(arrayBuffer);
       const parsedArchive = parser.parse();
 
+      // --- 動的ZIPファイル名の決定処理 ---
+      // メインHTMLリソースからhタグテキストを抽出
+      const mainResource = parsedArchive.WebMainResource;
+      if (mainResource && mainResource.WebResourceData) {
+        const foundTitle = extractHeadingText(mainResource.WebResourceData);
+        if (foundTitle) {
+          // OSのファイル名に使えない禁止文字（\ / : * ? " < > |）と、念のため改行を除去
+          const cleanedTitle = foundTitle
+            .replace(/[\\/:*?"<>|\r\n]/g, '')
+            .substring(0, 50); // 長すぎる場合の文字数制限（50文字）
+          
+          if (cleanedTitle) {
+            setZipName(cleanedTitle);
+          }
+        }
+      }
+
+      // --- 画像リソースの抽出処理 ---
       const subresources = parsedArchive.WebSubresources || [];
       const extracted: ExtractedImage[] = [];
 
@@ -357,7 +405,7 @@ export default function App() {
 
       const link = document.createElement('a');
       link.href = zipUrl;
-      link.download = 'extracted_images.zip';
+      link.download = `${zipName}.zip`; // 抽出したhタグの名前を適用
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -391,6 +439,7 @@ export default function App() {
         <div style={{ marginTop: '20px', padding: '10px', background: '#f0f0f0' }}>
           <h3>📊 抽出結果</h3>
           <p>画像の総数: <strong>{images.length} 件</strong></p>
+          <p>予定ファイル名: <strong>{zipName}.zip</strong></p>
           <button 
             onClick={downloadAllAsZip} 
             disabled={zipLoading}
