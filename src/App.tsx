@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 
+// ============================================================================
 // 1. 純JavaScript製 Binary PLIST パーサーエンジン
+// ============================================================================
 class BinaryPlistParser {
   private buffer: Uint8Array;
   private view: DataView;
@@ -131,9 +133,12 @@ class BinaryPlistParser {
   }
 }
 
-// 2. React メインコンポーネント (装飾なしシンプル版)
+// ============================================================================
+// 2. React メインコンポーネント (ZIP圧縮機能 & カウンター付き)
+// ============================================================================
 interface ExtractedImage {
   id: string;
+  blob: Blob;
   url: string;
   mimeType: string;
   filename: string;
@@ -142,7 +147,23 @@ interface ExtractedImage {
 export default function App() {
   const [images, setImages] = useState<ExtractedImage[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
+  const [zipLoading, setZipLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+
+  // JSZipライブラリをCDNから動的に読み込むヘルパー関数
+  const loadJSZip = (): Promise<any> => {
+    return new Promise((resolve, reject) => {
+      if ((window as any).JSZip) {
+        resolve((window as any).JSZip);
+        return;
+      }
+      const script = document.createElement('script');
+      script.src = 'https://cloudflare.com';
+      script.onload = () => resolve((window as any).JSZip);
+      script.onerror = () => reject(new Error('ZIPライブラリの読み込みに失敗しました。'));
+      document.head.appendChild(script);
+    });
+  };
 
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -171,10 +192,18 @@ export default function App() {
             const objectUrl = URL.createObjectURL(blob);
             
             const resourceUrl = resource.WebResourceURL || '';
-            const filename = resourceUrl.split('/').pop() || `image_${index}`;
+            let filename = resourceUrl.split('/').pop() || `image_${index}`;
+            
+            // クエリパラメータ等 (?v=123 など) が末尾についている場合の除去対策
+            filename = filename.split('?')[0];
+            if (!filename.includes('.') || filename.length < 4) {
+              const ext = mimeType.split('/')[1] || 'png';
+              filename = `${filename}.${ext}`;
+            }
 
             extracted.push({
               id: `${index}-${filename}`,
+              blob,
               url: objectUrl,
               mimeType,
               filename,
@@ -196,6 +225,42 @@ export default function App() {
     }
   };
 
+  // すべての画像を1つのZIPにまとめてダウンロードする関数
+  const downloadAllAsZip = async () => {
+    if (images.length === 0) return;
+    setZipLoading(true);
+    setError(null);
+
+    try {
+      // JSZipを準備
+      const JSZipInstance = await loadJSZip();
+      const zip = new JSZipInstance();
+
+      // 各画像のBlobデータをZIPに追加
+      images.forEach((img) => {
+        zip.file(img.filename, img.blob);
+      });
+
+      // ブラウザ上でZIPファイルを圧縮生成
+      const content = await zip.generateAsync({ type: 'blob' });
+      const zipUrl = URL.createObjectURL(content);
+
+      // 擬似的にリンクを作成してクリック（ダウンロード発火）
+      const link = document.createElement('a');
+      link.href = zipUrl;
+      link.download = 'extracted_images.zip';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(zipUrl);
+    } catch (err: any) {
+      console.error(err);
+      setError('ZIPファイルの作成中にエラーが発生しました。');
+    } finally {
+      setZipLoading(false);
+    }
+  };
+
   return (
     <div>
       <h1>Webアーカイブ 画像抽出ツール</h1>
@@ -213,6 +278,20 @@ export default function App() {
       {loading && <p>解析中...</p>}
       {error && <p style={{ color: 'red' }}>{error}</p>}
 
+      {images.length > 0 && (
+        <div style={{ marginTop: '20px', padding: '10px', background: '#f0f0f0' }}>
+          <h3>📊 抽出結果</h3>
+          <p>画像の総数: <strong>{images.length} 件</strong></p>
+          <button 
+            onClick={downloadAllAsZip} 
+            disabled={zipLoading}
+            style={{ padding: '8px 16px', fontSize: '14px', fontWeight: 'bold', cursor: 'pointer' }}
+          >
+            {zipLoading ? '🤐 ZIP圧縮中...' : '📦 すべての画像をZIPで保存'}
+          </button>
+        </div>
+      )}
+
       <div>
         {images.map((img) => (
           <div key={img.id} style={{ margin: '20px 0', border: '1px solid gray', padding: '10px' }}>
@@ -222,7 +301,7 @@ export default function App() {
               style={{ maxWidth: '200px', display: 'block' }} 
             />
             <p>{img.filename} ({img.mimeType})</p>
-            <a href={img.url} download={img.filename}>保存する</a>
+            <a href={img.url} download={img.filename}>個別で保存</a>
           </div>
         ))}
       </div>
